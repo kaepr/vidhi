@@ -20,7 +20,7 @@ impl From<&str> for Atom {
 }
 
 /// Represents a variable.
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Variable {
     pub name: String,
 }
@@ -59,8 +59,42 @@ pub struct Pattern {
 /// Binds a variable to a concrete value.
 pub type Bindings = HashMap<Variable, Atom>;
 
+/// Tries to unify a pattern to a fact, and returns updated bindings if found.
 pub fn unify(pattern: &Pattern, fact: &Fact, bindings: &Bindings) -> Option<Bindings> {
-    todo!()
+    let mut bindings = bindings.clone();
+    unify_slot(&pattern.entity, &fact.entity, &mut bindings)?;
+    unify_slot(&pattern.attribute, &fact.attribute, &mut bindings)?;
+    unify_slot(&pattern.value, &fact.value, &mut bindings)?;
+    Some(bindings)
+}
+
+fn unify_slot(term: &Term, atom: &Atom, bindings: &mut Bindings) -> Option<()> {
+    match term {
+        Term::Literal(l) => (l == atom).then_some(()),
+        Term::Variable(v) => match bindings.get(v) {
+            Some(l) => (l == atom).then_some(()),
+            None => {
+                bindings.insert(v.clone(), atom.clone());
+                Some(())
+            }
+        },
+    }
+}
+
+/// Find's all possible bindings for given database and conditions.
+pub fn match_rule(conditions: &[Pattern], facts: &[Fact], bindings: &Bindings) -> Vec<Bindings> {
+    match conditions.split_first() {
+        Some((first, rest)) => {
+            let mut results = Vec::new();
+            for fact in facts {
+                if let Some(new_bindings) = unify(first, fact, bindings) {
+                    results.extend(match_rule(rest, facts, &new_bindings));
+                }
+            }
+            results
+        }
+        None => vec![bindings.clone()],
+    }
 }
 
 #[macro_export]
@@ -153,7 +187,6 @@ mod tests {
     fn test_variable() {
         let variable = variable!(e);
         expect_that!(variable, eq(Variable::from("e")));
-
     }
 
     #[test_that::test]
@@ -165,7 +198,8 @@ mod tests {
                 entity: Term::Variable("e".into()),
                 attribute: Term::Literal("health".into()),
                 value: Term::Literal(10.into()),
-            }));
+            })
+        );
         let pattern = pattern!(?e, ?a, ?v);
         expect_that!(
             pattern,
@@ -173,6 +207,83 @@ mod tests {
                 entity: Term::Variable("e".into()),
                 attribute: Term::Variable("a".into()),
                 value: Term::Variable("v".into()),
-            }));
+            })
+        );
+    }
+
+    #[test_that::test]
+    fn test_unify() {
+        // new variables
+        let bindings = Bindings::new();
+        let result = unify(&pattern!(?e, age, ?a), &fact!(alice, age, 30), &bindings);
+        let expected = Bindings::from([
+            (variable!(e), Atom::from("alice")),
+            (variable!(a), Atom::from(30)),
+        ]);
+        expect_that!(result, some(eq(expected)));
+
+        // conflicts
+        let bindings = Bindings::from([(variable!(e), Atom::from("alice"))]);
+        let result = unify(
+            &pattern!(?e, likes, pizza),
+            &fact!(bob, likes, pizza),
+            &bindings,
+        );
+        expect_that!(result, none());
+    }
+
+    #[test_that::test]
+    fn test_match_rule() {
+        let facts = [
+            fact!(alice, likes, pizza),
+            fact!(alice, age, 30),
+            fact!(bob, likes, pasta),
+            fact!(bob, age, 25),
+        ];
+        // single fact found
+        let conditions = [pattern!(?e, age, ?a), pattern!(?e, likes, pizza)];
+        let bindings = Bindings::new();
+
+        let result = match_rule(&conditions, &facts, &bindings);
+
+        let expected = Bindings::from([
+            (variable!(e), Atom::from("alice")),
+            (variable!(a), Atom::from(30)),
+        ]);
+        expect_that!(result, contains_exactly!(eq(expected)));
+
+        // multiple bindings found
+        let conditions = [pattern!(?e, age, ?a)];
+        let bindings = Bindings::new();
+
+        let result = match_rule(&conditions, &facts, &bindings);
+
+        let expected_alice = Bindings::from([
+            (variable!(e), Atom::from("alice")),
+            (variable!(a), Atom::from(30)),
+        ]);
+        let expected_bob = Bindings::from([
+            (variable!(e), Atom::from("bob")),
+            (variable!(a), Atom::from(25)),
+        ]);
+        expect_that!(
+            result,
+            contains_exactly!(eq(expected_alice), eq(expected_bob))
+        );
+
+        // no patterns matched
+        let conditions = [pattern!(?e, likes, dosa)];
+        let bindings = Bindings::new();
+
+        let result = match_rule(&conditions, &facts, &bindings);
+
+        expect_that!(result, empty());
+
+        // existing bindings returned
+        let bindings = Bindings::from([(variable!(e), Atom::from("alice"))]);
+
+        let result = match_rule(&[], &facts, &bindings);
+
+        expect_that!(result, contains_exactly!(eq(bindings)));
     }
 }
