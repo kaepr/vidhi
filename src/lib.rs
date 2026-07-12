@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Represents a concrete value.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum Atom {
     String(String),
     Number(isize),
@@ -82,18 +82,74 @@ fn unify_slot(term: &Term, atom: &Atom, bindings: &mut Bindings) -> Option<()> {
 }
 
 /// Find's all possible bindings for given database and conditions.
-pub fn match_rule(conditions: &[Pattern], facts: &[Fact], bindings: &Bindings) -> Vec<Bindings> {
+pub fn match_rule<'a, F>(conditions: &[Pattern], facts: F, bindings: &Bindings) -> Vec<Bindings>
+where
+    F: IntoIterator<Item = &'a Fact> + Clone,
+{
     match conditions.split_first() {
         Some((first, rest)) => {
             let mut results = Vec::new();
-            for fact in facts {
+            for fact in facts.clone() {
                 if let Some(new_bindings) = unify(first, fact, bindings) {
-                    results.extend(match_rule(rest, facts, &new_bindings));
+                    results.extend(match_rule(rest, facts.clone(), &new_bindings));
                 }
             }
             results
         }
         None => vec![bindings.clone()],
+    }
+}
+
+/// Represents the working memory, comprised of facts.
+///
+/// # Invariant
+///
+/// - For a given (entity, attribute), only a single value can exist.
+#[derive(Default)]
+pub struct WorkingMemory {
+    /// Maps a (entity, attribute) -> (entity, attribute, value)
+    memory: BTreeMap<(Atom, Atom), Fact>,
+}
+
+/// Represents the change in working memory after an insert operation.
+#[derive(Debug, PartialEq)]
+pub enum InsertResult {
+    /// A fresh fact was added.
+    Added,
+    /// An existing fact was updated. The old value is returned.
+    Updated(Fact),
+    /// No facts were changed.
+    Unchanged,
+}
+
+impl WorkingMemory {
+    pub fn insert(&mut self, fact: Fact) -> InsertResult {
+        use std::collections::btree_map::Entry;
+
+        match self
+            .memory
+            .entry((fact.entity.clone(), fact.attribute.clone()))
+        {
+            Entry::Vacant(e) => {
+                e.insert(fact);
+                InsertResult::Added
+            }
+            Entry::Occupied(mut e) => {
+                if e.get().value == fact.value {
+                    InsertResult::Unchanged
+                } else {
+                    InsertResult::Updated(e.insert(fact))
+                }
+            }
+        }
+    }
+
+    pub fn retract(&mut self, entity: Atom, attribute: Atom) -> Option<Fact> {
+        self.memory.remove(&(entity, attribute))
+    }
+
+    pub fn facts(&self) -> impl Iterator<Item = &Fact> + Clone {
+        self.memory.values()
     }
 }
 
@@ -285,5 +341,23 @@ mod tests {
         let result = match_rule(&[], &facts, &bindings);
 
         expect_that!(result, contains_exactly!(eq(bindings)));
+    }
+
+    #[test_that::test]
+    fn test_working_memory() {
+        let mut wm = WorkingMemory::default();
+
+        let result = wm.insert(fact!(player, health, 10));
+        expect_that!(result, eq(InsertResult::Added));
+
+        let result = wm.insert(fact!(player, health, 8));
+        expect_that!(result, eq(InsertResult::Updated(fact!(player, health, 10))));
+        let facts: Vec<Fact> = wm.facts().cloned().collect();
+        expect_that!(facts, contains_exactly!(eq(fact!(player, health, 8))));
+
+        let result = wm.retract("player".into(), "health".into());
+        let facts: Vec<Fact> = wm.facts().cloned().collect();
+        expect_that!(facts.len(), eq(0));
+        expect_that!(result, some(eq(fact!(player, health, 8))));
     }
 }
