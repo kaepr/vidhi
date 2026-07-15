@@ -6,5 +6,8 @@ description = "A simple rule engine"
 license = "MIT"
 repository = "https://github.com/kaepr/vidhi"
 
+[dependencies]
+thiserror = "2"
+
 [dev-dependencies]
 test-that = "0.5.2"

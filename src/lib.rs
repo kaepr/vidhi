@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem;
+
+use thiserror::Error;
 
 /// Represents a concrete value.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -40,6 +43,15 @@ pub enum Term {
     Variable(Variable),
 }
 
+impl Term {
+    pub fn as_variable(&self) -> Option<&Variable> {
+        match self {
+            Term::Variable(v) => Some(v),
+            Term::Literal(_) => None,
+        }
+    }
+}
+
 /// Represents the facts in our database.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Fact {
@@ -54,6 +66,15 @@ pub struct Pattern {
     pub entity: Term,
     pub attribute: Term,
     pub value: Term,
+}
+
+impl Pattern {
+    /// Returns all variables from this given pattern.
+    fn variables(&self) -> impl Iterator<Item = &Variable> + '_ {
+        [&self.entity, &self.attribute, &self.value]
+            .into_iter()
+            .filter_map(Term::as_variable)
+    }
 }
 
 /// Binds a variable to a concrete value.
@@ -153,6 +174,145 @@ impl WorkingMemory {
     }
 }
 
+/// Valid operations supported in a guard.
+#[derive(Debug, Copy, Clone)]
+pub enum Op {
+    LessThan,
+    LessThanEqual,
+    GreaterThan,
+    GreaterThanEqual,
+    Equal,
+    NotEqual,
+}
+
+/// Guards a rule.
+#[derive(Debug, Clone)]
+pub struct Guard {
+    pub left: Term,
+    pub op: Op,
+    pub right: Term,
+}
+
+impl Guard {
+    /// Returns all variables from this given pattern.
+    fn variables(&self) -> impl Iterator<Item = &Variable> + '_ {
+        [&self.left, &self.right]
+            .into_iter()
+            .filter_map(Term::as_variable)
+    }
+}
+
+/// Action taken after a rule is matched.
+#[derive(Debug, Clone)]
+pub enum Action {
+    Insert(Pattern),
+}
+
+impl Action {
+    fn variables(&self) -> impl Iterator<Item = &Variable> + '_ {
+        match self {
+            Action::Insert(pattern) => pattern.variables(),
+        }
+    }
+}
+
+/// Represents a rule.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub name: String,
+    pub conditions: Vec<Pattern>,
+    pub guards: Vec<Guard>,
+    pub actions: Vec<Action>,
+}
+
+impl Rule {
+    pub fn new(
+        name: impl AsRef<str>,
+        conditions: Vec<Pattern>,
+        guards: Vec<Guard>,
+        actions: Vec<Action>,
+    ) -> Result<Rule, RuleError> {
+        let bounded: HashSet<&Variable> = conditions.iter().flat_map(Pattern::variables).collect();
+
+        // finds first of possibly many unbounded variables
+        let unbounded = guards
+            .iter()
+            .flat_map(Guard::variables)
+            .chain(actions.iter().flat_map(Action::variables))
+            .find(|&v| !bounded.contains(v));
+
+        if let Some(v) = unbounded {
+            return Err(RuleError::UnboundVariable(v.clone()));
+        }
+
+        Ok(Rule {
+            name: name.as_ref().to_owned(),
+            conditions,
+            guards,
+            actions,
+        })
+    }
+}
+
+/// Resolves a term to an atom.
+pub fn resolve(term: &Term, bindings: &Bindings) -> Option<Atom> {
+    match term {
+        Term::Literal(atom) => Some(atom.clone()),
+        Term::Variable(variable) => bindings.get(variable).cloned(),
+    }
+}
+
+#[derive(Error, Debug, PartialEq)]
+pub enum GuardError {
+    #[error("unbound variable {}", .0.name)]
+    UnboundVariable(Variable),
+    #[error("type mismatch: cannot compare {left:?} with {right:?}")]
+    TypeMismatch { left: Atom, right: Atom },
+}
+
+#[derive(Error, Debug)]
+pub enum RuleError {
+    #[error("unbound variable {0:?}")]
+    UnboundVariable(Variable),
+}
+
+/// Resolves to an atom, or returns an error with the unbound variable.
+fn resolve_or_err(term: &Term, bindings: &Bindings) -> Result<Atom, GuardError> {
+    match term {
+        Term::Literal(atom) => Ok(atom.clone()),
+        Term::Variable(var) => bindings
+            .get(var)
+            .cloned()
+            .ok_or_else(|| GuardError::UnboundVariable(var.clone())),
+    }
+}
+
+/// Evaluates a guard given bindings.
+///
+/// # Errors
+///
+/// - Returns [GuardError::TypeMismatch] when incompatible types are compared.
+/// - Returns [GuardError::UnboundVariable] when guard contains an unbound variable.
+pub fn eval(guard: &Guard, bindings: &Bindings) -> Result<bool, GuardError> {
+    let left = resolve_or_err(&guard.left, bindings)?;
+    let right = resolve_or_err(&guard.right, bindings)?;
+
+    if mem::discriminant(&left) != mem::discriminant(&right) {
+        return Err(GuardError::TypeMismatch { left, right });
+    }
+
+    let result = match guard.op {
+        Op::LessThan => left < right,
+        Op::LessThanEqual => left <= right,
+        Op::GreaterThan => left > right,
+        Op::GreaterThanEqual => left >= right,
+        Op::Equal => left == right,
+        Op::NotEqual => left != right,
+    };
+
+    Ok(result)
+}
+
 #[macro_export]
 macro_rules! atom {
     ($lit:literal) => {
@@ -215,6 +375,10 @@ macro_rules! pattern {
 mod tests {
     use super::*;
     use test_that::prelude::*;
+
+    fn guard(left: Term, op: Op, right: Term) -> Guard {
+        Guard { left, op, right }
+    }
 
     #[test_that::test]
     fn test_atom() {
@@ -359,5 +523,46 @@ mod tests {
         let facts: Vec<Fact> = wm.facts().cloned().collect();
         expect_that!(facts.len(), eq(0));
         expect_that!(result, some(eq(fact!(player, health, 8))));
+    }
+
+    #[test_that::test]
+    fn test_eval() {
+        let bindings = Bindings::from([
+            (variable!(h), Atom::from(8)),
+            (variable!(name), Atom::from("alice")),
+        ]);
+
+        // numeric smoke test
+        let g = guard(
+            Term::Variable(variable!(h)),
+            Op::LessThan,
+            Term::Literal(atom!(10)),
+        );
+        expect_that!(eval(&g, &bindings), eq(Ok(true)));
+
+        // type mismatch
+        let g = guard(
+            Term::Variable(variable!(h)),
+            Op::LessThan,
+            Term::Literal(atom!(bob)),
+        );
+        expect_that!(
+            eval(&g, &bindings),
+            eq(Err(GuardError::TypeMismatch {
+                left: Atom::from(8),
+                right: Atom::from("bob")
+            }))
+        );
+
+        // unbound variable
+        let g = guard(
+            Term::Variable(variable!(what)),
+            Op::LessThan,
+            Term::Literal(atom!(bob)),
+        );
+        expect_that!(
+            eval(&g, &bindings),
+            eq(Err(GuardError::UnboundVariable(variable!(what))))
+        );
     }
 }
