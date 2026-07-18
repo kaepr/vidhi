@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::iter::{self, IntoIterator, Iterator};
 use std::mem;
 
@@ -75,6 +75,31 @@ impl Pattern {
         [&self.entity, &self.attribute, &self.value]
             .into_iter()
             .filter_map(Term::as_variable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Condition {
+    pub pattern: Pattern,
+    /// Triggers the rule for matching changes iff true.
+    pub then: bool,
+}
+
+impl Condition {
+    pub fn support(pattern: Pattern) -> Condition {
+        Condition {
+            pattern,
+            then: false,
+        }
+    }
+}
+
+impl From<Pattern> for Condition {
+    fn from(pattern: Pattern) -> Self {
+        Condition {
+            pattern,
+            then: true,
+        }
     }
 }
 
@@ -188,6 +213,13 @@ pub enum InsertResult {
     Unchanged,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    Added(Fact),
+    Updated { old: Fact, new: Fact },
+    Retracted(Fact),
+}
+
 impl WorkingMemory {
     pub fn insert(&mut self, fact: Fact) -> InsertResult {
         use std::collections::btree_map::Entry;
@@ -265,19 +297,26 @@ impl Action {
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
-    pub conditions: Vec<Pattern>,
+    pub conditions: Vec<Condition>,
     pub guards: Vec<Guard>,
     pub actions: Vec<Action>,
 }
 
 impl Rule {
-    pub fn new(
+    pub fn new<C>(
         name: impl AsRef<str>,
-        conditions: Vec<Pattern>,
+        conditions: Vec<C>,
         guards: Vec<Guard>,
         actions: Vec<Action>,
-    ) -> Result<Rule, RuleError> {
-        let bounded: HashSet<&Variable> = conditions.iter().flat_map(Pattern::variables).collect();
+    ) -> Result<Rule, RuleError>
+    where
+        C: Into<Condition>,
+    {
+        let conditions: Vec<Condition> = conditions.into_iter().map(Into::into).collect();
+        let bounded: HashSet<&Variable> = conditions
+            .iter()
+            .flat_map(|c| c.pattern.variables())
+            .collect();
 
         // finds first of possibly many unbounded variables
         let unbounded = guards
@@ -411,6 +450,7 @@ fn instantiate(pattern: &ActionPattern, bindings: &Bindings) -> Result<Fact, Eva
 pub struct Engine {
     rules: Vec<Rule>,
     wm: WorkingMemory,
+    queue: VecDeque<Change>,
     fired: HashSet<(String, Bindings)>,
 }
 
@@ -420,22 +460,46 @@ impl Engine {
     }
 
     pub fn insert(&mut self, fact: Fact) -> InsertResult {
-        self.wm.insert(fact)
+        Self::track_insert(&mut self.wm, &mut self.queue, fact)
+    }
+
+    fn track_insert(
+        wm: &mut WorkingMemory,
+        queue: &mut VecDeque<Change>,
+        fact: Fact,
+    ) -> InsertResult {
+        match wm.insert(fact.clone()) {
+            InsertResult::Added => {
+                queue.push_back(Change::Added(fact));
+                InsertResult::Added
+            }
+            InsertResult::Updated(old) => {
+                queue.push_back(Change::Updated {
+                    old: old.clone(),
+                    new: fact,
+                });
+                InsertResult::Updated(old)
+            }
+            InsertResult::Unchanged => InsertResult::Unchanged,
+        }
     }
 
     pub fn facts(&self) -> impl Iterator<Item = &Fact> + Clone {
         self.wm.facts()
     }
 
-    pub fn run(&mut self, max_cycles: usize) -> Result<Run, EngineError> {
+    pub fn run_batch(&mut self, max_cycles: usize) -> Result<Run, EngineError> {
         let mut firings = Vec::new();
 
         for _ in 0..max_cycles {
             let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
 
             for rule in &self.rules {
+                let patterns: Vec<Pattern> =
+                    rule.conditions.iter().map(|c| c.pattern.clone()).collect();
+
                 'candidates: for bindings in
-                    match_rule(&rule.conditions, self.wm.facts(), &Bindings::new())
+                    match_rule(&patterns, self.wm.facts(), &Bindings::new())
                 {
                     for g in &rule.guards {
                         match eval(g, &bindings) {
@@ -492,6 +556,99 @@ impl Engine {
         Ok(Run {
             firings,
             is_stable: false,
+        })
+    }
+
+    pub fn run(&mut self, max_firings: usize) -> Result<Run, EngineError> {
+        let mut firings = Vec::new();
+
+        while let Some(change) = self.queue.pop_front() {
+            if firings.len() >= max_firings {
+                self.queue.push_front(change);
+                return Ok(Run {
+                    firings,
+                    is_stable: false,
+                });
+            }
+
+            let fact = match &change {
+                Change::Added(fact) => fact,
+                Change::Updated { new, .. } => new,
+                Change::Retracted(_) => continue,
+            };
+
+            let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
+            for rule in &self.rules {
+                let mut seen: Vec<Bindings> = Vec::new();
+                for (seat, condition) in rule.conditions.iter().enumerate() {
+                    if !condition.then {
+                        continue;
+                    }
+
+                    let Some(seed) = unify(&condition.pattern, fact, &Bindings::new()) else {
+                        continue;
+                    };
+
+                    let rest: Vec<Pattern> = rule
+                        .conditions
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != seat)
+                        .map(|(_, c)| c.pattern.clone())
+                        .collect();
+
+                    'candidates: for bindings in match_rule(&rest, self.wm.facts(), &seed) {
+                        if seen.contains(&bindings) {
+                            continue;
+                        }
+
+                        for g in &rule.guards {
+                            match eval(g, &bindings) {
+                                Ok(true) => {}
+                                Ok(false) => continue 'candidates,
+                                Err(source) => {
+                                    return Err(EngineError::Guard {
+                                        rule: rule.name.clone(),
+                                        source,
+                                    });
+                                }
+                            }
+                        }
+                        seen.push(bindings.clone());
+                        agenda.push((rule, bindings));
+                    }
+                }
+            }
+
+            for (rule, bindings) in agenda {
+                let mut inserted = Vec::new();
+                for action in &rule.actions {
+                    match action {
+                        Action::Insert(pattern) => {
+                            let fact = instantiate(pattern, &bindings).map_err(|source| {
+                                EngineError::Action {
+                                    rule: rule.name.clone(),
+                                    source,
+                                }
+                            })?;
+
+                            Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
+                            inserted.push(fact);
+                        }
+                    }
+                }
+
+                firings.push(Firing {
+                    rule: rule.name.clone(),
+                    bindings,
+                    inserted,
+                });
+            }
+        }
+
+        Ok(Run {
+            firings,
+            is_stable: true,
         })
     }
 }
@@ -828,7 +985,7 @@ mod tests {
         engine.add_rule(low_health);
         engine.add_rule(panic_rule);
 
-        let run = engine.run(10).unwrap();
+        let run = engine.run_batch(10).unwrap();
 
         // cycle 1: low-health fires; cycle 2: panic fires (cascade!); cycle 3: stable
         expect_that!(run.is_stable, eq(true));
@@ -847,7 +1004,7 @@ mod tests {
         );
 
         // refraction: same rules,s twice
-        let run = engine.run(10).unwrap();
+        let run = engine.run_batch(10).unwrap();
         expect_that!(run.firings, empty());
         expect_that!(run.is_stable, eq(true));
     }
@@ -870,7 +1027,7 @@ mod tests {
         .unwrap();
         engine.add_rule(move_player);
 
-        let run = engine.run(10).unwrap();
+        let run = engine.run_batch(10).unwrap();
 
         // every firing mints a binding refraction has never seen: pos=0, 1, 2, ...
         // the termination guarantee is dead — only max_cycles saves us
@@ -878,5 +1035,51 @@ mod tests {
         expect_that!(run.firings.len(), eq(10));
         let facts: Vec<Fact> = engine.facts().cloned().collect();
         expect_that!(facts, contains_exactly!(eq(fact!(player, position, 10))));
+    }
+
+    #[test_that::test]
+    fn test_move_player_changes() {
+        let mut engine = Engine::default();
+        engine.insert(fact!(player, position, 0));
+
+        let move_player = Rule::new(
+            "move-player",
+            vec![
+                Condition::from(pattern!(global, dt, ?dt)),
+                Condition::support(pattern!(?p, position, ?pos)),
+            ],
+            vec![],
+            vec![Action::Insert(ActionPattern {
+                entity: Term::Variable(variable!(p)),
+                attribute: Term::Literal(atom!(position)),
+                value: Expr::Add(
+                    Term::Variable(variable!(pos)),
+                    Term::Variable(variable!(dt)),
+                ),
+            })],
+        )
+        .unwrap();
+
+        engine.add_rule(move_player);
+
+        engine.insert(fact!(global, dt, 16));
+        let run = engine.run(100).unwrap();
+
+        expect_that!(run.is_stable, eq(true));
+        expect_that!(run.firings.len(), eq(1));
+
+        engine.insert(fact!(global, dt, 16));
+        let run = engine.run(100).unwrap();
+        expect_that!(run.firings, empty());
+
+        engine.insert(fact!(global, dt, 17));
+        let run = engine.run(100).unwrap();
+        expect_that!(run.firings.len(), eq(1));
+
+        let facts: Vec<Fact> = engine.facts().cloned().collect();
+        expect_that!(
+            facts,
+            contains_exactly!(eq(fact!(global, dt, 17)), eq(fact!(player, position, 33)))
+        );
     }
 }
