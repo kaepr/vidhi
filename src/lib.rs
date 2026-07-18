@@ -175,7 +175,7 @@ impl WorkingMemory {
 }
 
 /// Valid operations supported in a guard.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Op {
     LessThan,
     LessThanEqual,
@@ -186,7 +186,7 @@ pub enum Op {
 }
 
 /// Guards a rule.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Guard {
     pub left: Term,
     pub op: Op,
@@ -368,6 +368,40 @@ macro_rules! pattern {
             attribute: $attribute,
             value: Term::Literal(atom!($v))
         }
+    };
+}
+
+#[macro_export]
+macro_rules! guard {
+    (@right $left:expr, $op:expr, ? $r:ident) => {
+        Guard { left: $left, op: $op, right: Term::Variable(variable!($r)) }
+    };
+    (@right $left:expr, $op:expr, $r:tt) => {
+        Guard { left: $left, op: $op, right: Term::Literal(atom!($r)) }
+    };
+    (@op $left:expr, <  $($rest:tt)*) => {
+        guard!(@right $left, Op::LessThan,         $($rest)*)
+    };
+    (@op $left:expr, <= $($rest:tt)*) => {
+        guard!(@right $left, Op::LessThanEqual,    $($rest)*)
+    };
+    (@op $left:expr, >  $($rest:tt)*) => {
+         guard!(@right $left, Op::GreaterThan,      $($rest)*)
+    };
+    (@op $left:expr, >= $($rest:tt)*) => {
+        guard!(@right $left, Op::GreaterThanEqual, $($rest)*)
+    };
+    (@op $left:expr, == $($rest:tt)*) => {
+        guard!(@right $left, Op::Equal,            $($rest)*)
+    };
+    (@op $left:expr, != $($rest:tt)*) => {
+        guard!(@right $left, Op::NotEqual,         $($rest)*)
+    };
+    (? $l:ident $($rest:tt)*) => {
+        guard!(@op Term::Variable(variable!($l)), $($rest)*)
+    };
+    ($l:tt $($rest:tt)*)      => {
+        guard!(@op Term::Literal(atom!($l)), $($rest)*)
     };
 }
 
@@ -563,6 +597,29 @@ mod tests {
         expect_that!(
             eval(&g, &bindings),
             eq(Err(GuardError::UnboundVariable(variable!(what))))
+        );
+    }
+
+    #[test_that::test]
+    fn test_guard() {
+        let g = guard!(?h < 10);
+        expect_that!(
+            g,
+            eq(Guard {
+                left: Term::Variable(variable!(h)),
+                op: Op::LessThan,
+                right: Term::Literal(atom!(10))
+            })
+        );
+
+        let g = guard!(alice != ?name);
+        expect_that!(
+            g,
+            eq(Guard {
+                left: Term::Literal(atom!(alice)),
+                op: Op::NotEqual,
+                right: Term::Variable(variable!(name)),
+            })
         );
     }
 }
