@@ -463,6 +463,12 @@ impl Engine {
         Self::track_insert(&mut self.wm, &mut self.queue, fact)
     }
 
+    pub fn retract(&mut self, entity: Atom, attribute: Atom) -> Option<Fact> {
+        let fact = self.wm.retract(entity, attribute)?;
+        self.queue.push_back(Change::Retracted(fact.clone()));
+        Some(fact)
+    }
+
     fn track_insert(
         wm: &mut WorkingMemory,
         queue: &mut VecDeque<Change>,
@@ -1110,5 +1116,25 @@ mod tests {
             run.firings[0].bindings,
             eq(Bindings::from([(variable!(health), Atom::from(5))]))
         );
+    }
+
+    #[test_that::test]
+    fn run_does_not_fire_a_fact_retracted_before_firing() {
+        let mut engine = Engine::default();
+        let observe_health = Rule::new(
+            "observe-health",
+            vec![pattern!(player, health, ?health)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, health, ?health).into())],
+        )
+        .unwrap();
+        engine.add_rule(observe_health);
+
+        engine.insert(fact!(player, health, 10));
+        let retracted = engine.retract(atom!(player), atom!(health));
+
+        expect_that!(retracted, some(eq(fact!(player, health, 10))));
+        expect_that!(engine.run(100).unwrap().firings, empty());
+        expect_that!(engine.facts().count(), eq(0));
     }
 }
