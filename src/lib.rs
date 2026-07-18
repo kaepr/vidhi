@@ -451,7 +451,6 @@ pub struct Engine {
     rules: Vec<Rule>,
     wm: WorkingMemory,
     queue: VecDeque<Change>,
-    fired: HashSet<(String, Bindings)>,
 }
 
 impl Engine {
@@ -492,77 +491,6 @@ impl Engine {
 
     pub fn facts(&self) -> impl Iterator<Item = &Fact> + Clone {
         self.wm.facts()
-    }
-
-    pub fn run_batch(&mut self, max_cycles: usize) -> Result<Run, EngineError> {
-        let mut firings = Vec::new();
-
-        for _ in 0..max_cycles {
-            let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
-
-            for rule in &self.rules {
-                let patterns: Vec<Pattern> =
-                    rule.conditions.iter().map(|c| c.pattern.clone()).collect();
-
-                'candidates: for bindings in
-                    match_rule(&patterns, self.wm.facts(), &Bindings::new())
-                {
-                    for g in &rule.guards {
-                        match eval(g, &bindings) {
-                            Ok(true) => {}
-                            Ok(false) => continue 'candidates,
-                            Err(source) => {
-                                return Err(EngineError::Guard {
-                                    rule: rule.name.clone(),
-                                    source,
-                                });
-                            }
-                        }
-                    }
-
-                    if !self.fired.contains(&(rule.name.clone(), bindings.clone())) {
-                        agenda.push((rule, bindings));
-                    }
-                }
-            }
-
-            if agenda.is_empty() {
-                return Ok(Run {
-                    firings,
-                    is_stable: true,
-                });
-            }
-
-            for (rule, bindings) in agenda {
-                let mut inserted = Vec::new();
-                for action in &rule.actions {
-                    match action {
-                        Action::Insert(pattern) => {
-                            let fact = instantiate(pattern, &bindings).map_err(|source| {
-                                EngineError::Action {
-                                    rule: rule.name.clone(),
-                                    source,
-                                }
-                            })?;
-                            self.wm.insert(fact.clone());
-                            inserted.push(fact);
-                        }
-                    }
-                }
-
-                self.fired.insert((rule.name.clone(), bindings.clone()));
-                firings.push(Firing {
-                    rule: rule.name.clone(),
-                    bindings,
-                    inserted,
-                });
-            }
-        }
-
-        Ok(Run {
-            firings,
-            is_stable: false,
-        })
     }
 
     pub fn run(&mut self, max_firings: usize) -> Result<Run, EngineError> {
@@ -996,9 +924,9 @@ mod tests {
         engine.add_rule(low_health);
         engine.add_rule(panic_rule);
 
-        let run = engine.run_batch(10).unwrap();
+        let run = engine.run(10).unwrap();
 
-        // cycle 1: low-health fires; cycle 2: panic fires (cascade!); cycle 3: stable
+        // low-health fires, then its change causes panic to fire (cascade!).
         expect_that!(run.is_stable, eq(true));
         expect_that!(run.firings.len(), eq(2));
         expect_that!(run.firings[0].rule, eq("low-health".to_string()));
@@ -1014,8 +942,8 @@ mod tests {
             )
         );
 
-        // refraction: same rules,s twice
-        let run = engine.run_batch(10).unwrap();
+        // No new changes means there is nothing to trigger the rules again.
+        let run = engine.run(10).unwrap();
         expect_that!(run.firings, empty());
         expect_that!(run.is_stable, eq(true));
     }
@@ -1038,10 +966,9 @@ mod tests {
         .unwrap();
         engine.add_rule(move_player);
 
-        let run = engine.run_batch(10).unwrap();
+        let run = engine.run(10).unwrap();
 
-        // every firing mints a binding refraction has never seen: pos=0, 1, 2, ...
-        // the termination guarantee is dead — only max_cycles saves us
+        // Each position update triggers the rule again. Only max_firings stops the loop.
         expect_that!(run.is_stable, eq(false));
         expect_that!(run.firings.len(), eq(10));
         let facts: Vec<Fact> = engine.facts().cloned().collect();
