@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use std::iter::{self, IntoIterator, Iterator};
 use std::mem;
 
 use thiserror::Error;
 
 /// Represents a concrete value.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub enum Atom {
     String(String),
     Number(isize),
@@ -23,7 +24,7 @@ impl From<&str> for Atom {
 }
 
 /// Represents a variable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Variable {
     pub name: String,
 }
@@ -77,8 +78,52 @@ impl Pattern {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Term(Term),
+    Add(Term, Term),
+}
+
+impl Expr {
+    fn variables(&self) -> impl Iterator<Item = &Variable> + '_ {
+        let (x, xs) = match self {
+            Expr::Term(t) => (t, None),
+            Expr::Add(l, r) => (l, Some(r)),
+        };
+
+        iter::once(x).chain(xs).filter_map(Term::as_variable)
+    }
+}
+
+/// Allows computation for the [Pattern::value] slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionPattern {
+    pub entity: Term,
+    pub attribute: Term,
+    pub value: Expr,
+}
+
+impl ActionPattern {
+    fn variables(&self) -> impl Iterator<Item = &Variable> + '_ {
+        [&self.entity, &self.attribute]
+            .into_iter()
+            .filter_map(Term::as_variable)
+            .chain(self.value.variables())
+    }
+}
+
+impl From<Pattern> for ActionPattern {
+    fn from(p: Pattern) -> Self {
+        ActionPattern {
+            entity: p.entity,
+            attribute: p.attribute,
+            value: Expr::Term(p.value),
+        }
+    }
+}
+
 /// Binds a variable to a concrete value.
-pub type Bindings = HashMap<Variable, Atom>;
+pub type Bindings = BTreeMap<Variable, Atom>;
 
 /// Tries to unify a pattern to a fact, and returns updated bindings if found.
 pub fn unify(pattern: &Pattern, fact: &Fact, bindings: &Bindings) -> Option<Bindings> {
@@ -205,7 +250,7 @@ impl Guard {
 /// Action taken after a rule is matched.
 #[derive(Debug, Clone)]
 pub enum Action {
-    Insert(Pattern),
+    Insert(ActionPattern),
 }
 
 impl Action {
@@ -263,11 +308,27 @@ pub fn resolve(term: &Term, bindings: &Bindings) -> Option<Atom> {
 }
 
 #[derive(Error, Debug, PartialEq)]
-pub enum GuardError {
+pub enum EvalError {
     #[error("unbound variable {}", .0.name)]
     UnboundVariable(Variable),
     #[error("type mismatch: cannot compare {left:?} with {right:?}")]
     TypeMismatch { left: Atom, right: Atom },
+    #[error("cannot add {left:?} and {right:?}")]
+    Arithmetic { left: Atom, right: Atom },
+}
+
+fn eval_expr(expr: &Expr, bindings: &Bindings) -> Result<Atom, EvalError> {
+    match expr {
+        Expr::Term(term) => resolve_or_err(term, bindings),
+        Expr::Add(l, r) => {
+            let left = resolve_or_err(l, bindings)?;
+            let right = resolve_or_err(r, bindings)?;
+            match (left, right) {
+                (Atom::Number(a), Atom::Number(b)) => Ok(Atom::Number(a + b)),
+                (left, right) => Err(EvalError::Arithmetic { left, right }),
+            }
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -277,13 +338,13 @@ pub enum RuleError {
 }
 
 /// Resolves to an atom, or returns an error with the unbound variable.
-fn resolve_or_err(term: &Term, bindings: &Bindings) -> Result<Atom, GuardError> {
+fn resolve_or_err(term: &Term, bindings: &Bindings) -> Result<Atom, EvalError> {
     match term {
         Term::Literal(atom) => Ok(atom.clone()),
         Term::Variable(var) => bindings
             .get(var)
             .cloned()
-            .ok_or_else(|| GuardError::UnboundVariable(var.clone())),
+            .ok_or_else(|| EvalError::UnboundVariable(var.clone())),
     }
 }
 
@@ -293,12 +354,12 @@ fn resolve_or_err(term: &Term, bindings: &Bindings) -> Result<Atom, GuardError> 
 ///
 /// - Returns [GuardError::TypeMismatch] when incompatible types are compared.
 /// - Returns [GuardError::UnboundVariable] when guard contains an unbound variable.
-pub fn eval(guard: &Guard, bindings: &Bindings) -> Result<bool, GuardError> {
+pub fn eval(guard: &Guard, bindings: &Bindings) -> Result<bool, EvalError> {
     let left = resolve_or_err(&guard.left, bindings)?;
     let right = resolve_or_err(&guard.right, bindings)?;
 
     if mem::discriminant(&left) != mem::discriminant(&right) {
-        return Err(GuardError::TypeMismatch { left, right });
+        return Err(EvalError::TypeMismatch { left, right });
     }
 
     let result = match guard.op {
@@ -311,6 +372,128 @@ pub fn eval(guard: &Guard, bindings: &Bindings) -> Result<bool, GuardError> {
     };
 
     Ok(result)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Firing {
+    pub rule: String,
+    pub bindings: Bindings,
+    pub inserted: Vec<Fact>,
+}
+
+#[derive(Debug)]
+pub struct Run {
+    pub firings: Vec<Firing>,
+    /// No change in facts.
+    pub is_stable: bool,
+}
+
+#[derive(Error, Debug)]
+pub enum EngineError {
+    #[error("guard failed in rule {rule}")]
+    Guard { rule: String, source: EvalError },
+    #[error("action failed in rule {rule}")]
+    Action { rule: String, source: EvalError },
+}
+
+/// Instantiates the pattern to a concrete fact.
+///
+/// Resolves each term to it's value.
+fn instantiate(pattern: &ActionPattern, bindings: &Bindings) -> Result<Fact, EvalError> {
+    Ok(Fact {
+        entity: resolve_or_err(&pattern.entity, bindings)?,
+        attribute: resolve_or_err(&pattern.attribute, bindings)?,
+        value: eval_expr(&pattern.value, bindings)?,
+    })
+}
+
+#[derive(Default)]
+pub struct Engine {
+    rules: Vec<Rule>,
+    wm: WorkingMemory,
+    fired: HashSet<(String, Bindings)>,
+}
+
+impl Engine {
+    pub fn add_rule(&mut self, rule: Rule) {
+        self.rules.push(rule);
+    }
+
+    pub fn insert(&mut self, fact: Fact) -> InsertResult {
+        self.wm.insert(fact)
+    }
+
+    pub fn facts(&self) -> impl Iterator<Item = &Fact> + Clone {
+        self.wm.facts()
+    }
+
+    pub fn run(&mut self, max_cycles: usize) -> Result<Run, EngineError> {
+        let mut firings = Vec::new();
+
+        for _ in 0..max_cycles {
+            let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
+
+            for rule in &self.rules {
+                'candidates: for bindings in
+                    match_rule(&rule.conditions, self.wm.facts(), &Bindings::new())
+                {
+                    for g in &rule.guards {
+                        match eval(g, &bindings) {
+                            Ok(true) => {}
+                            Ok(false) => continue 'candidates,
+                            Err(source) => {
+                                return Err(EngineError::Guard {
+                                    rule: rule.name.clone(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+
+                    if !self.fired.contains(&(rule.name.clone(), bindings.clone())) {
+                        agenda.push((rule, bindings));
+                    }
+                }
+            }
+
+            if agenda.is_empty() {
+                return Ok(Run {
+                    firings,
+                    is_stable: true,
+                });
+            }
+
+            for (rule, bindings) in agenda {
+                let mut inserted = Vec::new();
+                for action in &rule.actions {
+                    match action {
+                        Action::Insert(pattern) => {
+                            let fact = instantiate(pattern, &bindings).map_err(|source| {
+                                EngineError::Action {
+                                    rule: rule.name.clone(),
+                                    source,
+                                }
+                            })?;
+                            self.wm.insert(fact.clone());
+                            inserted.push(fact);
+                        }
+                    }
+                }
+
+                self.fired.insert((rule.name.clone(), bindings.clone()));
+                firings.push(Firing {
+                    rule: rule.name.clone(),
+                    bindings,
+                    inserted,
+                });
+            }
+        }
+
+        Ok(Run {
+            firings,
+            is_stable: false,
+        })
+    }
 }
 
 #[macro_export]
@@ -582,7 +765,7 @@ mod tests {
         );
         expect_that!(
             eval(&g, &bindings),
-            eq(Err(GuardError::TypeMismatch {
+            eq(Err(EvalError::TypeMismatch {
                 left: Atom::from(8),
                 right: Atom::from("bob")
             }))
@@ -596,7 +779,7 @@ mod tests {
         );
         expect_that!(
             eval(&g, &bindings),
-            eq(Err(GuardError::UnboundVariable(variable!(what))))
+            eq(Err(EvalError::UnboundVariable(variable!(what))))
         );
     }
 
@@ -621,5 +804,79 @@ mod tests {
                 right: Term::Variable(variable!(name)),
             })
         );
+    }
+
+    #[test_that::test]
+    fn test_engine_run() {
+        let mut engine = Engine::default();
+        engine.insert(fact!(player, health, 3));
+
+        let low_health = Rule::new(
+            "low-health",
+            vec![pattern!(?e, health, ?h)],
+            vec![guard!(?h < 5)],
+            vec![Action::Insert(pattern!(?e, status, danger).into())],
+        )
+        .unwrap();
+        let panic_rule = Rule::new(
+            "panic",
+            vec![pattern!(?e, status, danger)],
+            vec![],
+            vec![Action::Insert(pattern!(?e, action, flee).into())],
+        )
+        .unwrap();
+        engine.add_rule(low_health);
+        engine.add_rule(panic_rule);
+
+        let run = engine.run(10).unwrap();
+
+        // cycle 1: low-health fires; cycle 2: panic fires (cascade!); cycle 3: stable
+        expect_that!(run.is_stable, eq(true));
+        expect_that!(run.firings.len(), eq(2));
+        expect_that!(run.firings[0].rule, eq("low-health".to_string()));
+        expect_that!(run.firings[1].rule, eq("panic".to_string()));
+
+        let facts: Vec<Fact> = engine.facts().cloned().collect();
+        expect_that!(
+            facts,
+            contains_exactly!(
+                eq(fact!(player, health, 3)),
+                eq(fact!(player, status, danger)),
+                eq(fact!(player, action, flee)),
+            )
+        );
+
+        // refraction: same rules,s twice
+        let run = engine.run(10).unwrap();
+        expect_that!(run.firings, empty());
+        expect_that!(run.is_stable, eq(true));
+    }
+
+    #[test_that::test]
+    fn test_move_player() {
+        let mut engine = Engine::default();
+        engine.insert(fact!(player, position, 0));
+
+        let move_player = Rule::new(
+            "move-player",
+            vec![pattern!(?p, position, ?pos)],
+            vec![],
+            vec![Action::Insert(ActionPattern {
+                entity: Term::Variable(variable!(p)),
+                attribute: Term::Literal(atom!(position)),
+                value: Expr::Add(Term::Variable(variable!(pos)), Term::Literal(atom!(1))),
+            })],
+        )
+        .unwrap();
+        engine.add_rule(move_player);
+
+        let run = engine.run(10).unwrap();
+
+        // every firing mints a binding refraction has never seen: pos=0, 1, 2, ...
+        // the termination guarantee is dead — only max_cycles saves us
+        expect_that!(run.is_stable, eq(false));
+        expect_that!(run.firings.len(), eq(10));
+        let facts: Vec<Fact> = engine.facts().cloned().collect();
+        expect_that!(facts, contains_exactly!(eq(fact!(player, position, 10))));
     }
 }
