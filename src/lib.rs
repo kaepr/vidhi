@@ -577,6 +577,11 @@ impl Engine {
                 Change::Retracted(_) => continue,
             };
 
+            let key = (fact.entity.clone(), fact.attribute.clone());
+            if self.wm.memory.get(&key) != Some(fact) {
+                continue;
+            }
+
             let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
             for rule in &self.rules {
                 let mut seen: Vec<Bindings> = Vec::new();
@@ -1080,6 +1085,30 @@ mod tests {
         expect_that!(
             facts,
             contains_exactly!(eq(fact!(global, dt, 17)), eq(fact!(player, position, 33)))
+        );
+    }
+
+    #[test_that::test]
+    fn run_ignores_changes_superseded_before_firing() {
+        let mut engine = Engine::default();
+        let observe_health = Rule::new(
+            "observe-health",
+            vec![pattern!(player, health, ?health)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, health, ?health).into())],
+        )
+        .unwrap();
+        engine.add_rule(observe_health);
+
+        engine.insert(fact!(player, health, 10));
+        engine.insert(fact!(player, health, 5));
+
+        let run = engine.run(100).unwrap();
+
+        expect_that!(run.firings.len(), eq(1));
+        expect_that!(
+            run.firings[0].bindings,
+            eq(Bindings::from([(variable!(health), Atom::from(5))]))
         );
     }
 }
