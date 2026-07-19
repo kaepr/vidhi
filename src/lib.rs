@@ -423,8 +423,15 @@ pub struct Firing {
 #[derive(Debug)]
 pub struct Run {
     pub firings: Vec<Firing>,
-    /// No change in facts.
-    pub is_stable: bool,
+    pub status: RunStatus,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RunStatus {
+    /// No changes or activations remain to be processed.
+    Quiescence,
+    /// Changes or activations remain after the firing budget was consumed.
+    FiringLimitReached,
 }
 
 #[derive(Error, Debug)]
@@ -607,10 +614,13 @@ impl Engine {
             });
         }
 
-        Ok(Run {
-            firings,
-            is_stable: self.queue.is_empty() && self.agenda.is_empty(),
-        })
+        let status = if self.queue.is_empty() && self.agenda.is_empty() {
+            RunStatus::Quiescence
+        } else {
+            RunStatus::FiringLimitReached
+        };
+
+        Ok(Run { firings, status })
     }
 }
 
@@ -949,7 +959,7 @@ mod tests {
         let run = engine.run(10)?;
 
         // low-health fires, then its change causes panic to fire (cascade!).
-        expect_that!(run.is_stable, eq(true));
+        expect_that!(run.status, eq(RunStatus::Quiescence));
         expect_that!(run.firings.len(), eq(2));
         expect_that!(run.firings[0].rule, eq("low-health".to_string()));
         expect_that!(run.firings[1].rule, eq("panic".to_string()));
@@ -967,7 +977,7 @@ mod tests {
         // No new changes means there is nothing to trigger the rules again.
         let run = engine.run(10)?;
         expect_that!(run.firings, empty());
-        expect_that!(run.is_stable, eq(true));
+        expect_that!(run.status, eq(RunStatus::Quiescence));
 
         Ok(())
     }
@@ -992,7 +1002,7 @@ mod tests {
         let run = engine.run(10)?;
 
         // Each position update triggers the rule again. Only max_firings stops the loop.
-        expect_that!(run.is_stable, eq(false));
+        expect_that!(run.status, eq(RunStatus::FiringLimitReached));
         expect_that!(run.firings.len(), eq(10));
         let facts: Vec<Fact> = engine.facts().cloned().collect();
         expect_that!(facts, contains_exactly!(eq(fact!(player, position, 10))));
@@ -1027,7 +1037,7 @@ mod tests {
         engine.insert(fact!(global, dt, 16));
         let run = engine.run(100)?;
 
-        expect_that!(run.is_stable, eq(true));
+        expect_that!(run.status, eq(RunStatus::Quiescence));
         expect_that!(run.firings.len(), eq(1));
 
         engine.insert(fact!(global, dt, 16));
@@ -1113,7 +1123,7 @@ mod tests {
         let first_run = engine.run(1)?;
         expect_that!(first_run.firings.len(), eq(1));
         expect_that!(first_run.firings[0].rule, eq("first-observer".to_string()));
-        expect_that!(first_run.is_stable, eq(false));
+        expect_that!(first_run.status, eq(RunStatus::FiringLimitReached));
 
         let second_run = engine.run(1)?;
         expect_that!(second_run.firings.len(), eq(1));
@@ -1121,7 +1131,7 @@ mod tests {
             second_run.firings[0].rule,
             eq("second-observer".to_string())
         );
-        expect_that!(second_run.is_stable, eq(true));
+        expect_that!(second_run.status, eq(RunStatus::Quiescence));
 
         Ok(())
     }
