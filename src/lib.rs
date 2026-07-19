@@ -504,106 +504,107 @@ impl Engine {
         let mut firings = Vec::new();
 
         while firings.len() < max_firings {
-            if let Some(activation) = self.agenda.pop_front() {
-                let rule = &self.rules[activation.rule];
-                let patterns: Vec<Pattern> = rule
-                    .conditions
-                    .iter()
-                    .map(|condition| condition.pattern.clone())
-                    .collect();
-                if !match_rule(&patterns, self.wm.facts(), &Bindings::new())
-                    .contains(&activation.bindings)
-                {
-                    continue;
-                }
+            if self.agenda.is_empty() {
+                let mut scheduled = HashSet::new();
+                while let Some(change) = self.queue.pop_front() {
+                    let fact = match &change {
+                        Change::Added(fact) => fact,
+                        Change::Updated { new, .. } => new,
+                        Change::Retracted(_) => continue,
+                    };
 
-                let rule_name = rule.name.clone();
-                let actions = rule.actions.clone();
-                let mut inserted = Vec::new();
-                for action in &actions {
-                    match action {
-                        Action::Insert(pattern) => {
-                            let fact =
-                                instantiate(pattern, &activation.bindings).map_err(|source| {
-                                    EngineError::Action {
-                                        rule: rule_name.clone(),
-                                        source,
+                    let key = (fact.entity.clone(), fact.attribute.clone());
+                    if self.wm.memory.get(&key) != Some(fact) {
+                        continue;
+                    }
+
+                    for (rule_index, rule) in self.rules.iter().enumerate() {
+                        for (seat, condition) in rule.conditions.iter().enumerate() {
+                            if !condition.then {
+                                continue;
+                            }
+
+                            let Some(seed) = unify(&condition.pattern, fact, &Bindings::new())
+                            else {
+                                continue;
+                            };
+
+                            let rest: Vec<Pattern> = rule
+                                .conditions
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i != seat)
+                                .map(|(_, c)| c.pattern.clone())
+                                .collect();
+
+                            'candidates: for bindings in match_rule(&rest, self.wm.facts(), &seed) {
+                                if !scheduled.insert((rule_index, bindings.clone())) {
+                                    continue;
+                                }
+
+                                for g in &rule.guards {
+                                    match eval(g, &bindings) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue 'candidates,
+                                        Err(source) => {
+                                            return Err(EngineError::Guard {
+                                                rule: rule.name.clone(),
+                                                source,
+                                            });
+                                        }
                                     }
-                                })?;
-
-                            Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
-                            inserted.push(fact);
+                                }
+                                self.agenda.push_back(Activation {
+                                    rule: rule_index,
+                                    bindings,
+                                });
+                            }
                         }
                     }
                 }
-
-                firings.push(Firing {
-                    rule: rule_name,
-                    bindings: activation.bindings,
-                    inserted,
-                });
-                continue;
             }
 
-            let Some(change) = self.queue.pop_front() else {
+            let Some(activation) = self.agenda.pop_front() else {
                 break;
             };
 
-            let fact = match &change {
-                Change::Added(fact) => fact,
-                Change::Updated { new, .. } => new,
-                Change::Retracted(_) => continue,
-            };
-
-            let key = (fact.entity.clone(), fact.attribute.clone());
-            if self.wm.memory.get(&key) != Some(fact) {
+            let rule = &self.rules[activation.rule];
+            let patterns: Vec<Pattern> = rule
+                .conditions
+                .iter()
+                .map(|condition| condition.pattern.clone())
+                .collect();
+            if !match_rule(&patterns, self.wm.facts(), &Bindings::new())
+                .contains(&activation.bindings)
+            {
                 continue;
             }
 
-            for (rule_index, rule) in self.rules.iter().enumerate() {
-                let mut seen: Vec<Bindings> = Vec::new();
-                for (seat, condition) in rule.conditions.iter().enumerate() {
-                    if !condition.then {
-                        continue;
-                    }
-
-                    let Some(seed) = unify(&condition.pattern, fact, &Bindings::new()) else {
-                        continue;
-                    };
-
-                    let rest: Vec<Pattern> = rule
-                        .conditions
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != seat)
-                        .map(|(_, c)| c.pattern.clone())
-                        .collect();
-
-                    'candidates: for bindings in match_rule(&rest, self.wm.facts(), &seed) {
-                        if seen.contains(&bindings) {
-                            continue;
-                        }
-
-                        for g in &rule.guards {
-                            match eval(g, &bindings) {
-                                Ok(true) => {}
-                                Ok(false) => continue 'candidates,
-                                Err(source) => {
-                                    return Err(EngineError::Guard {
-                                        rule: rule.name.clone(),
-                                        source,
-                                    });
+            let rule_name = rule.name.clone();
+            let actions = rule.actions.clone();
+            let mut inserted = Vec::new();
+            for action in &actions {
+                match action {
+                    Action::Insert(pattern) => {
+                        let fact =
+                            instantiate(pattern, &activation.bindings).map_err(|source| {
+                                EngineError::Action {
+                                    rule: rule_name.clone(),
+                                    source,
                                 }
-                            }
-                        }
-                        seen.push(bindings.clone());
-                        self.agenda.push_back(Activation {
-                            rule: rule_index,
-                            bindings,
-                        });
+                            })?;
+
+                        Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
+                        inserted.push(fact);
                     }
                 }
             }
+
+            firings.push(Firing {
+                rule: rule_name,
+                bindings: activation.bindings,
+                inserted,
+            });
         }
 
         Ok(Run {
@@ -1121,5 +1122,30 @@ mod tests {
             eq("second-observer".to_string())
         );
         expect_that!(second_run.is_stable, eq(true));
+    }
+
+    #[test_that::test]
+    fn run_schedules_an_activation_once_per_change_batch() {
+        let mut engine = Engine::default();
+        engine.add_rule(
+            Rule::new(
+                "observe-living-player",
+                vec![
+                    pattern!(?player, health, ?health),
+                    pattern!(?player, status, alive),
+                ],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        );
+
+        engine.insert(fact!(alice, health, 10));
+        engine.insert(fact!(alice, status, alive));
+
+        let run = engine.run(100).unwrap();
+
+        expect_that!(run.firings.len(), eq(1));
+        expect_that!(run.firings[0].rule, eq("observe-living-player".to_string()));
     }
 }
