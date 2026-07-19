@@ -452,6 +452,12 @@ struct Activation {
     bindings: Bindings,
 }
 
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum AddRuleError {
+    #[error("rule {name:?} already exists")]
+    DuplicateName { name: String },
+}
+
 #[derive(Default)]
 pub struct Engine {
     rules: Vec<Rule>,
@@ -461,8 +467,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn add_rule(&mut self, rule: Rule) {
+    pub fn add_rule(&mut self, rule: Rule) -> Result<(), AddRuleError> {
+        if self.rules.iter().any(|existing| existing.name == rule.name) {
+            return Err(AddRuleError::DuplicateName { name: rule.name });
+        }
+
         self.rules.push(rule);
+        Ok(())
     }
 
     pub fn insert(&mut self, fact: Fact) -> InsertResult {
@@ -697,6 +708,8 @@ macro_rules! guard {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use test_that::prelude::*;
 
@@ -914,7 +927,7 @@ mod tests {
     }
 
     #[test_that::test]
-    fn test_engine_run() {
+    fn test_engine_run() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         engine.insert(fact!(player, health, 3));
 
@@ -923,19 +936,17 @@ mod tests {
             vec![pattern!(?e, health, ?h)],
             vec![guard!(?h < 5)],
             vec![Action::Insert(pattern!(?e, status, danger).into())],
-        )
-        .unwrap();
+        )?;
         let panic_rule = Rule::new(
             "panic",
             vec![pattern!(?e, status, danger)],
             vec![],
             vec![Action::Insert(pattern!(?e, action, flee).into())],
-        )
-        .unwrap();
-        engine.add_rule(low_health);
-        engine.add_rule(panic_rule);
+        )?;
+        engine.add_rule(low_health)?;
+        engine.add_rule(panic_rule)?;
 
-        let run = engine.run(10).unwrap();
+        let run = engine.run(10)?;
 
         // low-health fires, then its change causes panic to fire (cascade!).
         expect_that!(run.is_stable, eq(true));
@@ -954,13 +965,15 @@ mod tests {
         );
 
         // No new changes means there is nothing to trigger the rules again.
-        let run = engine.run(10).unwrap();
+        let run = engine.run(10)?;
         expect_that!(run.firings, empty());
         expect_that!(run.is_stable, eq(true));
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn test_move_player() {
+    fn test_move_player() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         engine.insert(fact!(player, position, 0));
 
@@ -973,21 +986,22 @@ mod tests {
                 attribute: Term::Literal(atom!(position)),
                 value: Expr::Add(Term::Variable(variable!(pos)), Term::Literal(atom!(1))),
             })],
-        )
-        .unwrap();
-        engine.add_rule(move_player);
+        )?;
+        engine.add_rule(move_player)?;
 
-        let run = engine.run(10).unwrap();
+        let run = engine.run(10)?;
 
         // Each position update triggers the rule again. Only max_firings stops the loop.
         expect_that!(run.is_stable, eq(false));
         expect_that!(run.firings.len(), eq(10));
         let facts: Vec<Fact> = engine.facts().cloned().collect();
         expect_that!(facts, contains_exactly!(eq(fact!(player, position, 10))));
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn test_move_player_changes() {
+    fn test_move_player_changes() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         engine.insert(fact!(player, position, 0));
 
@@ -1006,23 +1020,22 @@ mod tests {
                     Term::Variable(variable!(dt)),
                 ),
             })],
-        )
-        .unwrap();
+        )?;
 
-        engine.add_rule(move_player);
+        engine.add_rule(move_player)?;
 
         engine.insert(fact!(global, dt, 16));
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
 
         expect_that!(run.is_stable, eq(true));
         expect_that!(run.firings.len(), eq(1));
 
         engine.insert(fact!(global, dt, 16));
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
         expect_that!(run.firings, empty());
 
         engine.insert(fact!(global, dt, 17));
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
         expect_that!(run.firings.len(), eq(1));
 
         let facts: Vec<Fact> = engine.facts().cloned().collect();
@@ -1030,138 +1043,131 @@ mod tests {
             facts,
             contains_exactly!(eq(fact!(global, dt, 17)), eq(fact!(player, position, 33)))
         );
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn run_ignores_changes_superseded_before_firing() {
+    fn run_ignores_changes_superseded_before_firing() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         let observe_health = Rule::new(
             "observe-health",
             vec![pattern!(player, health, ?health)],
             vec![],
             vec![Action::Insert(pattern!(observer, health, ?health).into())],
-        )
-        .unwrap();
-        engine.add_rule(observe_health);
+        )?;
+        engine.add_rule(observe_health)?;
 
         engine.insert(fact!(player, health, 10));
         engine.insert(fact!(player, health, 5));
 
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
 
         expect_that!(run.firings.len(), eq(1));
         expect_that!(
             run.firings[0].bindings,
             eq(Bindings::from([(variable!(health), Atom::from(5))]))
         );
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn run_does_not_fire_a_fact_retracted_before_firing() {
+    fn run_does_not_fire_a_fact_retracted_before_firing() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         let observe_health = Rule::new(
             "observe-health",
             vec![pattern!(player, health, ?health)],
             vec![],
             vec![Action::Insert(pattern!(observer, health, ?health).into())],
-        )
-        .unwrap();
-        engine.add_rule(observe_health);
+        )?;
+        engine.add_rule(observe_health)?;
 
         engine.insert(fact!(player, health, 10));
         let retracted = engine.retract(atom!(player), atom!(health));
 
         expect_that!(retracted, some(eq(fact!(player, health, 10))));
-        expect_that!(engine.run(100).unwrap().firings, empty());
+        expect_that!(engine.run(100)?.firings, empty());
         expect_that!(engine.facts().count(), eq(0));
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn run_preserves_activations_beyond_the_firing_limit() {
+    fn run_preserves_activations_beyond_the_firing_limit() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
-        engine.add_rule(
-            Rule::new(
-                "first-observer",
-                vec![pattern!(player, health, ?health)],
-                vec![],
-                vec![],
-            )
-            .unwrap(),
-        );
-        engine.add_rule(
-            Rule::new(
-                "second-observer",
-                vec![pattern!(player, health, ?health)],
-                vec![],
-                vec![],
-            )
-            .unwrap(),
-        );
+        engine.add_rule(Rule::new(
+            "first-observer",
+            vec![pattern!(player, health, ?health)],
+            vec![],
+            vec![],
+        )?)?;
+        engine.add_rule(Rule::new(
+            "second-observer",
+            vec![pattern!(player, health, ?health)],
+            vec![],
+            vec![],
+        )?)?;
         engine.insert(fact!(player, health, 10));
 
-        let first_run = engine.run(1).unwrap();
+        let first_run = engine.run(1)?;
         expect_that!(first_run.firings.len(), eq(1));
         expect_that!(first_run.firings[0].rule, eq("first-observer".to_string()));
         expect_that!(first_run.is_stable, eq(false));
 
-        let second_run = engine.run(1).unwrap();
+        let second_run = engine.run(1)?;
         expect_that!(second_run.firings.len(), eq(1));
         expect_that!(
             second_run.firings[0].rule,
             eq("second-observer".to_string())
         );
         expect_that!(second_run.is_stable, eq(true));
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn run_schedules_an_activation_once_per_change_batch() {
+    fn run_schedules_an_activation_once_per_change_batch() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
-        engine.add_rule(
-            Rule::new(
-                "observe-living-player",
-                vec![
-                    pattern!(?player, health, ?health),
-                    pattern!(?player, status, alive),
-                ],
-                vec![],
-                vec![],
-            )
-            .unwrap(),
-        );
+        engine.add_rule(Rule::new(
+            "observe-living-player",
+            vec![
+                pattern!(?player, health, ?health),
+                pattern!(?player, status, alive),
+            ],
+            vec![],
+            vec![],
+        )?)?;
 
         engine.insert(fact!(alice, health, 10));
         engine.insert(fact!(alice, status, alive));
 
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
 
         expect_that!(run.firings.len(), eq(1));
         expect_that!(run.firings[0].rule, eq("observe-living-player".to_string()));
+
+        Ok(())
     }
 
     #[test_that::test]
-    fn run_fires_every_activation_captured_for_a_batch() {
+    fn run_fires_every_activation_captured_for_a_batch() -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
-        engine.add_rule(
-            Rule::new(
-                "change-blue-to-green",
-                vec![pattern!(player, color, blue)],
-                vec![],
-                vec![Action::Insert(pattern!(player, color, green).into())],
-            )
-            .unwrap(),
-        );
-        engine.add_rule(
-            Rule::new(
-                "observe-blue",
-                vec![pattern!(player, color, blue)],
-                vec![],
-                vec![Action::Insert(pattern!(observer, saw, blue).into())],
-            )
-            .unwrap(),
-        );
+        engine.add_rule(Rule::new(
+            "change-blue-to-green",
+            vec![pattern!(player, color, blue)],
+            vec![],
+            vec![Action::Insert(pattern!(player, color, green).into())],
+        )?)?;
+        engine.add_rule(Rule::new(
+            "observe-blue",
+            vec![pattern!(player, color, blue)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, saw, blue).into())],
+        )?)?;
         engine.insert(fact!(player, color, blue));
 
-        let run = engine.run(100).unwrap();
+        let run = engine.run(100)?;
 
         expect_that!(run.firings.len(), eq(2));
         expect_that!(run.firings[0].rule, eq("change-blue-to-green".to_string()));
@@ -1173,5 +1179,38 @@ mod tests {
                 eq(fact!(observer, saw, blue)),
             )
         );
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn engine_rejects_duplicate_rule_names() -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        let first = Rule::new(
+            "observe-health",
+            vec![pattern!(alice, health, ?health)],
+            vec![],
+            vec![],
+        )?;
+        let duplicate = Rule::new(
+            "observe-health",
+            vec![pattern!(bob, health, ?health)],
+            vec![],
+            vec![],
+        )?;
+
+        engine.add_rule(first)?;
+        expect_that!(
+            engine.add_rule(duplicate),
+            eq(Err(AddRuleError::DuplicateName {
+                name: "observe-health".to_string(),
+            }))
+        );
+
+        engine.insert(fact!(alice, health, 10));
+        engine.insert(fact!(bob, health, 10));
+        expect_that!(engine.run(100)?.firings.len(), eq(1));
+
+        Ok(())
     }
 }
