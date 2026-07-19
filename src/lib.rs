@@ -518,6 +518,11 @@ impl Engine {
         self.wm.facts()
     }
 
+    /// Runs rules in deterministic order until no work remains or the firing limit is reached.
+    ///
+    /// Changes are considered in FIFO order. Matching then follows rule registration order,
+    /// condition declaration order, and working-memory fact order. Actions execute in their
+    /// declaration order.
     pub fn run(&mut self, max_firings: usize) -> Result<Run, EngineError> {
         let mut firings = Vec::new();
 
@@ -1220,6 +1225,45 @@ mod tests {
         engine.insert(fact!(alice, health, 10));
         engine.insert(fact!(bob, health, 10));
         expect_that!(engine.run(100)?.firings.len(), eq(1));
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn run_uses_rule_registration_and_fact_order() -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        let conditions = || {
+            vec![
+                Condition::from(pattern!(global, dt, ?dt)),
+                Condition::support(pattern!(?player, position, ?position)),
+            ]
+        };
+        engine.add_rule(Rule::new("first-rule", conditions(), vec![], vec![])?)?;
+        engine.add_rule(Rule::new("second-rule", conditions(), vec![], vec![])?)?;
+
+        // Facts are deliberately inserted in reverse entity order.
+        engine.insert(fact!(bob, position, 0));
+        engine.insert(fact!(alice, position, 0));
+        engine.insert(fact!(global, dt, 16));
+
+        let run = engine.run(100)?;
+        let player = variable!(player);
+
+        expect_that!(run.firings.len(), eq(4));
+        expect_that!(run.firings[0].rule, eq("first-rule".to_string()));
+        expect_that!(
+            run.firings[0].bindings.get(&player),
+            some(eq(&atom!(alice)))
+        );
+        expect_that!(run.firings[1].rule, eq("first-rule".to_string()));
+        expect_that!(run.firings[1].bindings.get(&player), some(eq(&atom!(bob))));
+        expect_that!(run.firings[2].rule, eq("second-rule".to_string()));
+        expect_that!(
+            run.firings[2].bindings.get(&player),
+            some(eq(&atom!(alice)))
+        );
+        expect_that!(run.firings[3].rule, eq("second-rule".to_string()));
+        expect_that!(run.firings[3].bindings.get(&player), some(eq(&atom!(bob))));
 
         Ok(())
     }
