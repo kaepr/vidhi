@@ -453,6 +453,23 @@ fn instantiate(pattern: &ActionPattern, bindings: &Bindings) -> Result<Fact, Eva
     })
 }
 
+fn guards_match(rule: &Rule, bindings: &Bindings) -> Result<bool, EngineError> {
+    for guard in &rule.guards {
+        match eval(guard, bindings) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(source) => {
+                return Err(EngineError::Guard {
+                    rule: rule.name.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 #[derive(Debug)]
 struct Activation {
     rule: usize,
@@ -470,6 +487,7 @@ pub struct Engine {
     rules: Vec<Rule>,
     wm: WorkingMemory,
     queue: VecDeque<Change>,
+    added_rules: VecDeque<usize>,
     agenda: VecDeque<Activation>,
 }
 
@@ -480,6 +498,7 @@ impl Engine {
         }
 
         self.rules.push(rule);
+        self.added_rules.push_back(self.rules.len() - 1);
         Ok(())
     }
 
@@ -561,28 +580,52 @@ impl Engine {
                                 .collect();
 
                             'candidates: for bindings in match_rule(&rest, self.wm.facts(), &seed) {
-                                if !scheduled.insert((rule_index, bindings.clone())) {
+                                if scheduled.contains(&(rule_index, bindings.clone())) {
                                     continue;
                                 }
 
-                                for g in &rule.guards {
-                                    match eval(g, &bindings) {
-                                        Ok(true) => {}
-                                        Ok(false) => continue 'candidates,
-                                        Err(source) => {
-                                            return Err(EngineError::Guard {
-                                                rule: rule.name.clone(),
-                                                source,
-                                            });
-                                        }
-                                    }
+                                if !guards_match(rule, &bindings)? {
+                                    continue 'candidates;
                                 }
+
+                                scheduled.insert((rule_index, bindings.clone()));
                                 self.agenda.push_back(Activation {
                                     rule: rule_index,
                                     bindings,
                                 });
                             }
                         }
+                    }
+                }
+
+                while let Some(rule_index) = self.added_rules.pop_front() {
+                    let rule = &self.rules[rule_index];
+                    if !rule.conditions.iter().any(|condition| condition.then) {
+                        continue;
+                    }
+
+                    let patterns: Vec<Pattern> = rule
+                        .conditions
+                        .iter()
+                        .map(|condition| condition.pattern.clone())
+                        .collect();
+
+                    'candidates: for bindings in
+                        match_rule(&patterns, self.wm.facts(), &Bindings::new())
+                    {
+                        if scheduled.contains(&(rule_index, bindings.clone())) {
+                            continue;
+                        }
+
+                        if !guards_match(rule, &bindings)? {
+                            continue 'candidates;
+                        }
+
+                        scheduled.insert((rule_index, bindings.clone()));
+                        self.agenda.push_back(Activation {
+                            rule: rule_index,
+                            bindings,
+                        });
                     }
                 }
             }
@@ -626,11 +669,12 @@ impl Engine {
             });
         }
 
-        let status = if self.queue.is_empty() && self.agenda.is_empty() {
-            RunStatus::Quiescence
-        } else {
-            RunStatus::FiringLimitReached
-        };
+        let status =
+            if self.queue.is_empty() && self.added_rules.is_empty() && self.agenda.is_empty() {
+                RunStatus::Quiescence
+            } else {
+                RunStatus::FiringLimitReached
+            };
 
         Ok(Run { firings, status })
     }
@@ -1326,6 +1370,39 @@ mod tests {
 
         expect_that!(second_run.firings.len(), eq(1));
         expect_that!(second_run.firings[0].changes, empty());
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn adding_a_rule_evaluates_existing_facts_once() -> Result<(), Box<dyn Error>> {
+        let observe_health = || {
+            Rule::new(
+                "observe-health",
+                vec![pattern!(?player, health, ?health)],
+                vec![],
+                vec![],
+            )
+        };
+
+        let mut settled_engine = Engine::default();
+        settled_engine.insert(fact!(alice, health, 10));
+        settled_engine.run(100)?;
+        settled_engine.add_rule(observe_health()?)?;
+        expect_that!(settled_engine.run(100)?.firings.len(), eq(1));
+
+        settled_engine.add_rule(Rule::new(
+            "support-only",
+            vec![Condition::support(pattern!(?player, health, ?health))],
+            vec![],
+            vec![],
+        )?)?;
+        expect_that!(settled_engine.run(100)?.firings, empty());
+
+        let mut pending_engine = Engine::default();
+        pending_engine.insert(fact!(alice, health, 10));
+        pending_engine.add_rule(observe_health()?)?;
+        expect_that!(pending_engine.run(100)?.firings.len(), eq(1));
 
         Ok(())
     }
