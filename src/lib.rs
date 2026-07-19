@@ -594,7 +594,7 @@ impl Engine {
             let rule = &self.rules[activation.rule];
             let rule_name = rule.name.clone();
             let actions = rule.actions.clone();
-            let mut inserted = Vec::new();
+            let mut produced = Vec::new();
             for action in &actions {
                 match action {
                     Action::Insert(pattern) => {
@@ -605,17 +605,19 @@ impl Engine {
                                     source,
                                 }
                             })?;
-
-                        Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
-                        inserted.push(fact);
+                        produced.push(fact);
                     }
                 }
+            }
+
+            for fact in &produced {
+                Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
             }
 
             firings.push(Firing {
                 rule: rule_name,
                 bindings: activation.bindings,
-                inserted,
+                inserted: produced,
             });
         }
 
@@ -1264,6 +1266,33 @@ mod tests {
         );
         expect_that!(run.firings[3].rule, eq("second-rule".to_string()));
         expect_that!(run.firings[3].bindings.get(&player), some(eq(&atom!(bob))));
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn firing_does_not_apply_actions_when_evaluation_fails() -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        engine.add_rule(Rule::new(
+            "invalid-second-action",
+            vec![pattern!(player, status, ready)],
+            vec![],
+            vec![
+                Action::Insert(pattern!(observer, status, started).into()),
+                Action::Insert(ActionPattern {
+                    entity: Term::Literal(atom!(observer)),
+                    attribute: Term::Literal(atom!(total)),
+                    value: Expr::Add(Term::Literal(atom!(invalid)), Term::Literal(atom!(1))),
+                }),
+            ],
+        )?)?;
+        engine.insert(fact!(player, status, ready));
+
+        expect_that!(engine.run(100), err(anything()));
+        expect_that!(
+            engine.facts().cloned().collect::<Vec<_>>(),
+            contains_exactly!(eq(fact!(player, status, ready)))
+        );
 
         Ok(())
     }
