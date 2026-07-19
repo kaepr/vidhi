@@ -442,6 +442,14 @@ pub enum EngineError {
     Action { rule: String, source: EvalError },
 }
 
+#[derive(Error, Debug)]
+#[error("{source}")]
+pub struct RunError {
+    #[source]
+    pub source: EngineError,
+    pub firings: Vec<Firing>,
+}
+
 /// Instantiates the pattern to a concrete fact.
 ///
 /// Resolves each term to it's value.
@@ -542,7 +550,7 @@ impl Engine {
     /// Changes are considered in FIFO order. Matching then follows rule registration order,
     /// condition declaration order, and working-memory fact order. Actions execute in their
     /// declaration order.
-    pub fn run(&mut self, max_firings: usize) -> Result<Run, EngineError> {
+    pub fn run(&mut self, max_firings: usize) -> Result<Run, RunError> {
         let mut firings = Vec::new();
 
         while firings.len() < max_firings {
@@ -584,7 +592,11 @@ impl Engine {
                                     continue;
                                 }
 
-                                if !guards_match(rule, &bindings)? {
+                                let matches = match guards_match(rule, &bindings) {
+                                    Ok(matches) => matches,
+                                    Err(source) => return Err(RunError { source, firings }),
+                                };
+                                if !matches {
                                     continue 'candidates;
                                 }
 
@@ -617,7 +629,11 @@ impl Engine {
                             continue;
                         }
 
-                        if !guards_match(rule, &bindings)? {
+                        let matches = match guards_match(rule, &bindings) {
+                            Ok(matches) => matches,
+                            Err(source) => return Err(RunError { source, firings }),
+                        };
+                        if !matches {
                             continue 'candidates;
                         }
 
@@ -641,13 +657,18 @@ impl Engine {
             for action in &actions {
                 match action {
                     Action::Insert(pattern) => {
-                        let fact =
-                            instantiate(pattern, &activation.bindings).map_err(|source| {
-                                EngineError::Action {
-                                    rule: rule_name.clone(),
-                                    source,
-                                }
-                            })?;
+                        let fact = match instantiate(pattern, &activation.bindings) {
+                            Ok(fact) => fact,
+                            Err(source) => {
+                                return Err(RunError {
+                                    source: EngineError::Action {
+                                        rule: rule_name.clone(),
+                                        source,
+                                    },
+                                    firings,
+                                });
+                            }
+                        };
                         produced.push(fact);
                     }
                 }
@@ -1403,6 +1424,53 @@ mod tests {
         pending_engine.insert(fact!(alice, health, 10));
         pending_engine.add_rule(observe_health()?)?;
         expect_that!(pending_engine.run(100)?.firings.len(), eq(1));
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn run_error_reports_completed_firings_and_preserves_later_activations()
+    -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        engine.add_rule(Rule::new(
+            "first-rule",
+            vec![pattern!(player, status, ready)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, first, complete).into())],
+        )?)?;
+        engine.add_rule(Rule::new(
+            "failing-rule",
+            vec![pattern!(player, status, ready)],
+            vec![],
+            vec![Action::Insert(ActionPattern {
+                entity: Term::Literal(atom!(observer)),
+                attribute: Term::Literal(atom!(invalid)),
+                value: Expr::Add(Term::Literal(atom!(invalid)), Term::Literal(atom!(1))),
+            })],
+        )?)?;
+        engine.add_rule(Rule::new(
+            "last-rule",
+            vec![pattern!(player, status, ready)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, last, complete).into())],
+        )?)?;
+        engine.insert(fact!(player, status, ready));
+
+        let failure = engine.run(100).err().ok_or("expected the run to fail")?;
+
+        expect_that!(failure.firings.len(), eq(1));
+        expect_that!(failure.firings[0].rule, eq("first-rule".to_string()));
+        expect_that!(
+            engine.facts().cloned().collect::<Vec<_>>(),
+            contains_exactly!(
+                eq(fact!(player, status, ready)),
+                eq(fact!(observer, first, complete)),
+            )
+        );
+
+        let resumed = engine.run(100)?;
+        expect_that!(resumed.firings.len(), eq(1));
+        expect_that!(resumed.firings[0].rule, eq("last-rule".to_string()));
 
         Ok(())
     }
