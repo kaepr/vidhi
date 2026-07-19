@@ -446,11 +446,18 @@ fn instantiate(pattern: &ActionPattern, bindings: &Bindings) -> Result<Fact, Eva
     })
 }
 
+#[derive(Debug)]
+struct Activation {
+    rule: usize,
+    bindings: Bindings,
+}
+
 #[derive(Default)]
 pub struct Engine {
     rules: Vec<Rule>,
     wm: WorkingMemory,
     queue: VecDeque<Change>,
+    agenda: VecDeque<Activation>,
 }
 
 impl Engine {
@@ -496,14 +503,51 @@ impl Engine {
     pub fn run(&mut self, max_firings: usize) -> Result<Run, EngineError> {
         let mut firings = Vec::new();
 
-        while let Some(change) = self.queue.pop_front() {
-            if firings.len() >= max_firings {
-                self.queue.push_front(change);
-                return Ok(Run {
-                    firings,
-                    is_stable: false,
+        while firings.len() < max_firings {
+            if let Some(activation) = self.agenda.pop_front() {
+                let rule = &self.rules[activation.rule];
+                let patterns: Vec<Pattern> = rule
+                    .conditions
+                    .iter()
+                    .map(|condition| condition.pattern.clone())
+                    .collect();
+                if !match_rule(&patterns, self.wm.facts(), &Bindings::new())
+                    .contains(&activation.bindings)
+                {
+                    continue;
+                }
+
+                let rule_name = rule.name.clone();
+                let actions = rule.actions.clone();
+                let mut inserted = Vec::new();
+                for action in &actions {
+                    match action {
+                        Action::Insert(pattern) => {
+                            let fact =
+                                instantiate(pattern, &activation.bindings).map_err(|source| {
+                                    EngineError::Action {
+                                        rule: rule_name.clone(),
+                                        source,
+                                    }
+                                })?;
+
+                            Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
+                            inserted.push(fact);
+                        }
+                    }
+                }
+
+                firings.push(Firing {
+                    rule: rule_name,
+                    bindings: activation.bindings,
+                    inserted,
                 });
+                continue;
             }
+
+            let Some(change) = self.queue.pop_front() else {
+                break;
+            };
 
             let fact = match &change {
                 Change::Added(fact) => fact,
@@ -516,8 +560,7 @@ impl Engine {
                 continue;
             }
 
-            let mut agenda: Vec<(&Rule, Bindings)> = Vec::new();
-            for rule in &self.rules {
+            for (rule_index, rule) in self.rules.iter().enumerate() {
                 let mut seen: Vec<Bindings> = Vec::new();
                 for (seat, condition) in rule.conditions.iter().enumerate() {
                     if !condition.then {
@@ -554,40 +597,18 @@ impl Engine {
                             }
                         }
                         seen.push(bindings.clone());
-                        agenda.push((rule, bindings));
+                        self.agenda.push_back(Activation {
+                            rule: rule_index,
+                            bindings,
+                        });
                     }
                 }
-            }
-
-            for (rule, bindings) in agenda {
-                let mut inserted = Vec::new();
-                for action in &rule.actions {
-                    match action {
-                        Action::Insert(pattern) => {
-                            let fact = instantiate(pattern, &bindings).map_err(|source| {
-                                EngineError::Action {
-                                    rule: rule.name.clone(),
-                                    source,
-                                }
-                            })?;
-
-                            Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
-                            inserted.push(fact);
-                        }
-                    }
-                }
-
-                firings.push(Firing {
-                    rule: rule.name.clone(),
-                    bindings,
-                    inserted,
-                });
             }
         }
 
         Ok(Run {
             firings,
-            is_stable: true,
+            is_stable: self.queue.is_empty() && self.agenda.is_empty(),
         })
     }
 }
@@ -1063,5 +1084,42 @@ mod tests {
         expect_that!(retracted, some(eq(fact!(player, health, 10))));
         expect_that!(engine.run(100).unwrap().firings, empty());
         expect_that!(engine.facts().count(), eq(0));
+    }
+
+    #[test_that::test]
+    fn run_preserves_activations_beyond_the_firing_limit() {
+        let mut engine = Engine::default();
+        engine.add_rule(
+            Rule::new(
+                "first-observer",
+                vec![pattern!(player, health, ?health)],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        );
+        engine.add_rule(
+            Rule::new(
+                "second-observer",
+                vec![pattern!(player, health, ?health)],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        );
+        engine.insert(fact!(player, health, 10));
+
+        let first_run = engine.run(1).unwrap();
+        expect_that!(first_run.firings.len(), eq(1));
+        expect_that!(first_run.firings[0].rule, eq("first-observer".to_string()));
+        expect_that!(first_run.is_stable, eq(false));
+
+        let second_run = engine.run(1).unwrap();
+        expect_that!(second_run.firings.len(), eq(1));
+        expect_that!(
+            second_run.firings[0].rule,
+            eq("second-observer".to_string())
+        );
+        expect_that!(second_run.is_stable, eq(true));
     }
 }
