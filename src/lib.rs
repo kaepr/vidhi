@@ -569,17 +569,6 @@ impl Engine {
             };
 
             let rule = &self.rules[activation.rule];
-            let patterns: Vec<Pattern> = rule
-                .conditions
-                .iter()
-                .map(|condition| condition.pattern.clone())
-                .collect();
-            if !match_rule(&patterns, self.wm.facts(), &Bindings::new())
-                .contains(&activation.bindings)
-            {
-                continue;
-            }
-
             let rule_name = rule.name.clone();
             let actions = rule.actions.clone();
             let mut inserted = Vec::new();
@@ -1147,5 +1136,42 @@ mod tests {
 
         expect_that!(run.firings.len(), eq(1));
         expect_that!(run.firings[0].rule, eq("observe-living-player".to_string()));
+    }
+
+    #[test_that::test]
+    fn run_fires_every_activation_captured_for_a_batch() {
+        let mut engine = Engine::default();
+        engine.add_rule(
+            Rule::new(
+                "change-blue-to-green",
+                vec![pattern!(player, color, blue)],
+                vec![],
+                vec![Action::Insert(pattern!(player, color, green).into())],
+            )
+            .unwrap(),
+        );
+        engine.add_rule(
+            Rule::new(
+                "observe-blue",
+                vec![pattern!(player, color, blue)],
+                vec![],
+                vec![Action::Insert(pattern!(observer, saw, blue).into())],
+            )
+            .unwrap(),
+        );
+        engine.insert(fact!(player, color, blue));
+
+        let run = engine.run(100).unwrap();
+
+        expect_that!(run.firings.len(), eq(2));
+        expect_that!(run.firings[0].rule, eq("change-blue-to-green".to_string()));
+        expect_that!(run.firings[1].rule, eq("observe-blue".to_string()));
+        expect_that!(
+            engine.facts().cloned().collect::<Vec<_>>(),
+            contains_exactly!(
+                eq(fact!(player, color, green)),
+                eq(fact!(observer, saw, blue)),
+            )
+        );
     }
 }
