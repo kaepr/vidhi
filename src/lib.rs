@@ -417,7 +417,7 @@ pub fn eval(guard: &Guard, bindings: &Bindings) -> Result<bool, EvalError> {
 pub struct Firing {
     pub rule: String,
     pub bindings: Bindings,
-    pub inserted: Vec<Fact>,
+    pub changes: Vec<Change>,
 }
 
 #[derive(Debug)]
@@ -610,14 +610,19 @@ impl Engine {
                 }
             }
 
-            for fact in &produced {
-                Self::track_insert(&mut self.wm, &mut self.queue, fact.clone());
+            let mut changes = Vec::new();
+            for fact in produced {
+                match Self::track_insert(&mut self.wm, &mut self.queue, fact.clone()) {
+                    InsertResult::Added => changes.push(Change::Added(fact)),
+                    InsertResult::Updated(old) => changes.push(Change::Updated { old, new: fact }),
+                    InsertResult::Unchanged => {}
+                }
             }
 
             firings.push(Firing {
                 rule: rule_name,
                 bindings: activation.bindings,
-                inserted: produced,
+                changes,
             });
         }
 
@@ -1293,6 +1298,34 @@ mod tests {
             engine.facts().cloned().collect::<Vec<_>>(),
             contains_exactly!(eq(fact!(player, status, ready)))
         );
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn firing_reports_only_facts_that_changed() -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        engine.add_rule(Rule::new(
+            "observe-tick",
+            vec![pattern!(global, tick, ?tick)],
+            vec![],
+            vec![Action::Insert(pattern!(observer, status, ready).into())],
+        )?)?;
+        engine.insert(fact!(global, tick, 1));
+
+        let first_run = engine.run(100)?;
+
+        expect_that!(first_run.firings.len(), eq(1));
+        expect_that!(
+            first_run.firings[0].changes,
+            contains_exactly!(eq(Change::Added(fact!(observer, status, ready))))
+        );
+
+        engine.insert(fact!(global, tick, 2));
+        let second_run = engine.run(100)?;
+
+        expect_that!(second_run.firings.len(), eq(1));
+        expect_that!(second_run.firings[0].changes, empty());
 
         Ok(())
     }
