@@ -549,7 +549,8 @@ impl Engine {
     ///
     /// Changes are considered in FIFO order. Matching then follows rule registration order,
     /// condition declaration order, and working-memory fact order. Actions execute in their
-    /// declaration order.
+    /// declaration order. When multiple actions write the same fact key, the last write in this
+    /// order determines the final value.
     pub fn run(&mut self, max_firings: usize) -> Result<Run, RunError> {
         let mut firings = Vec::new();
 
@@ -1429,8 +1430,8 @@ mod tests {
     }
 
     #[test_that::test]
-    fn run_error_reports_completed_firings_and_preserves_later_activations()
-    -> Result<(), Box<dyn Error>> {
+    fn run_error_reports_completed_firings_and_preserves_later_activations(
+    ) -> Result<(), Box<dyn Error>> {
         let mut engine = Engine::default();
         engine.add_rule(Rule::new(
             "first-rule",
@@ -1471,6 +1472,45 @@ mod tests {
         let resumed = engine.run(100)?;
         expect_that!(resumed.firings.len(), eq(1));
         expect_that!(resumed.firings[0].rule, eq("last-rule".to_string()));
+
+        Ok(())
+    }
+
+    #[test_that::test]
+    fn later_firings_win_when_writing_the_same_fact() -> Result<(), Box<dyn Error>> {
+        let mut engine = Engine::default();
+        engine.add_rule(Rule::new(
+            "set-happy",
+            vec![pattern!(global, tick, 1)],
+            vec![],
+            vec![Action::Insert(pattern!(player, mood, happy).into())],
+        )?)?;
+        engine.add_rule(Rule::new(
+            "set-sad",
+            vec![pattern!(global, tick, 1)],
+            vec![],
+            vec![Action::Insert(pattern!(player, mood, sad).into())],
+        )?)?;
+        engine.insert(fact!(global, tick, 1));
+
+        let run = engine.run(100)?;
+
+        expect_that!(run.firings.len(), eq(2));
+        expect_that!(
+            run.firings[0].changes,
+            contains_exactly!(eq(Change::Added(fact!(player, mood, happy))))
+        );
+        expect_that!(
+            run.firings[1].changes,
+            contains_exactly!(eq(Change::Updated {
+                old: fact!(player, mood, happy),
+                new: fact!(player, mood, sad),
+            }))
+        );
+        expect_that!(
+            engine.facts().cloned().collect::<Vec<_>>(),
+            contains_exactly!(eq(fact!(global, tick, 1)), eq(fact!(player, mood, sad)),)
+        );
 
         Ok(())
     }
